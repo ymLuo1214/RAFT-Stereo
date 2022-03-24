@@ -178,13 +178,50 @@ class ConvGRU(nn.Module):
         h=(1-z)*h+z*q
         return h
 
+
+def pool2x(x):
+    return F.avg_pool2d(x, 3, stride=2, padding=1)
+def interp(x, dest):
+    interp_args = {'mode': 'bilinear', 'align_corners': True}
+    return F.interpolate(x, dest.shape[2:], **interp_args)
+
+
+
+
+
 class BasicMotionEncoder(nn.Module):
-    def __init__(self,args):
-        super().__init__()
-        self.args=args
-        cor_planes=args.cor_levels*(2*args.cor_radius+1)
+    def __init__(self, args):
+        super(BasicMotionEncoder, self).__init__()
+        self.args = args
+
+        cor_planes = args.corr_levels * (2*args.corr_radius + 1)
+
+        self.convc1 = nn.Conv2d(cor_planes, 64, 1, padding=0)
+        self.convc2 = nn.Conv2d(64, 64, 3, padding=1)
+        self.convf1 = nn.Conv2d(2, 64, 7, padding=3)
+        self.convf2 = nn.Conv2d(64, 64, 3, padding=1)
+        self.conv = nn.Conv2d(64+64, 128-2, 3, padding=1)
+
+    def forward(self, flow, corr):
+        cor = F.relu(self.convc1(corr))
+        cor = F.relu(self.convc2(cor))
+        flo = F.relu(self.convf1(flow))
+        flo = F.relu(self.convf2(flo))
+
+        cor_flo = torch.cat([cor, flo], dim=1)
+        out = F.relu(self.conv(cor_flo))
+        return torch.cat([out, flow], dim=1)
 
 
+class FlowHead(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=256, output_dim=2):
+        super(FlowHead, self).__init__()
+        self.conv1 = nn.Conv2d(input_dim, hidden_dim, 3, padding=1)
+        self.conv2 = nn.Conv2d(hidden_dim, output_dim, 3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.conv2(self.relu(self.conv1(x)))
 
 class BasicMultiUpdateBlock(nn.Module):
     def __init__(self,args,hidden_dims=[]):
@@ -192,8 +229,56 @@ class BasicMultiUpdateBlock(nn.Module):
         self.args=args
         self.encoder=BasicMotionEncoder(args)
         encoder_output_dim=128
+        self.gru08 = ConvGRU(hidden_dims[2], encoder_output_dim + hidden_dims[1] * (args.n_gru_layers > 1))
+        self.gru16 = ConvGRU(hidden_dims[1], hidden_dims[0] * (args.n_gru_layers == 3) + hidden_dims[2])
+        self.gru32 = ConvGRU(hidden_dims[0], hidden_dims[1])
+        self.flow_head = FlowHead(hidden_dims[2], hidden_dim=256, output_dim=2)
+        factor = 2**self.args.n_downsample
 
-def bilinear_sampler(img,coords,mode)
+        self.mask = nn.Sequential(
+            nn.Conv2d(hidden_dims[2], 256, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, (factor**2)*9, 1, padding=0))
+    def forward(self, net, inp, corr=None, flow=None, iter08=True, iter16=True, iter32=True, update=True):
+
+        if iter32:
+            net[2] = self.gru32(net[2], *(inp[2]), pool2x(net[1]))
+        if iter16:
+            if self.args.n_gru_layers > 2:
+                net[1] = self.gru16(net[1], *(inp[1]), pool2x(net[0]), interp(net[2], net[1]))
+            else:
+                net[1] = self.gru16(net[1], *(inp[1]), pool2x(net[0]))
+        if iter08:
+            motion_features = self.encoder(flow, corr)
+            if self.args.n_gru_layers > 1:
+                net[0] = self.gru08(net[0], *(inp[0]), motion_features, interp(net[1], net[0]))
+            else:
+                net[0] = self.gru08(net[0], *(inp[0]), motion_features)
+
+        if not update:
+            return net
+
+        delta_flow = self.flow_head(net[0])
+
+        # scale mask to balence gradients
+        mask = .25 * self.mask(net[0])
+        return net, mask, delta_flow
+
+def bilinear_sampler(img, coords, mode='bilinear', mask=False):
+    """ Wrapper for grid_sample, uses pixel coordinates """
+    H, W = img.shape[-2:]
+    xgrid, ygrid = coords.split([1,1], dim=-1)
+    xgrid = 2*xgrid/(W-1) - 1
+    assert torch.unique(ygrid).numel() == 1 and H == 1 # This is a stereo problem
+
+    grid = torch.cat([xgrid, ygrid], dim=-1)
+    img = F.grid_sample(img, grid, align_corners=True)
+
+    if mask:
+        mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)
+        return img, mask.float()
+
+    return img
 
 class CorrBlock1D:
     def __init__(self,fmap1,fmap2,num_levels=4,radius=4):
@@ -207,11 +292,11 @@ class CorrBlock1D:
         self.corr_pyramid.append(corr)
         for i in range(self.num_levels):
             corr = F.avg_pool2d(corr, [1, 2], stride=[1, 2])
-            self.corr_pyramid.append(corr)
+            self.corr_pyramid.append(corr)                  #得到不同分辨率的相关金字塔
 
-    def __call__(self, coords):  #coords:N*2*H*W
+    def __call__(self, coords):  #coords:N*2*H1*W1
         r=self.radius
-        coords=coords[:,:1].permute(0,2,3,1)       #N*H*W*1
+        coords=coords[:,:1].permute(0,2,3,1)       #N*H1*W1*1
         batch,h1,w1,_=coords.shape
 
         out_pyramid=[]
@@ -220,15 +305,15 @@ class CorrBlock1D:
             dx=torch.linspace(-r,r,2*r+1)
             dx=dx.view(1,1,2*r+1,1).to(coords.device)
             x0=dx+coords.reshape(batch*h1*w1,1,1,1)/2**i
-            y0=torch.zeros_like(x0)
+            y0=torch.zeros_like(x0)     #x0、y0:（B*H1*W1）*1*2r+1*1
 
-            coords_lvl = torch.cat([x0, y0], dim=-1)
-            corr = bilinear_sampler(corr, coords_lvl)
-            corr = corr.view(batch, h1, w1, -1)
+            coords_lvl = torch.cat([x0, y0], dim=-1)       #coords_lvl(B*H1*W1)*1*2r+1*2,coor:(B*H1*W1)*1*1*W2
+            corr = bilinear_sampler(corr, coords_lvl)      #返回(B*H1*W1)*1*1*2r+1
+            corr = corr.view(batch, h1, w1, -1)            #整合成B*H1*W1*2r+1
             out_pyramid.append(corr)
 
         out = torch.cat(out_pyramid, dim=-1)
-        return out.permute(0, 3, 1, 2).contiguous().float()
+        return out.permute(0, 3, 1, 2).contiguous().float()     #返回B*C*H1*W1,其中C为num_level*(2*r+1)
 
     @staticmethod
     def corr(fmap1,fmap2):
@@ -253,7 +338,7 @@ class RAFTStereo(nn.Module):
         self.args=args
         context_dims=args.hidden_dims #隐藏层维数和文本信息维数
         self.cnet=BasicEncoder(output_dim=[args.hidden_dims,context_dims],norm_fn="batch",downsample=args.n_downsample)  #特征提取，输出不同分辨率的context和左右特征图
-        self.update_block=BasicMultiUpdateBlock(self.args,hidden_dims==args.hidden_dims)
+        self.update_block=BasicMultiUpdateBlock(self.args.hidden_dims==args.hidden_dims)
         self.context_zqr_convs = nn.ModuleList(
             [nn.Conv2d(context_dims[i], args.hidden_dims[i] * 3, 3, padding=3 // 2) for i in
              range(self.args.n_gru_layers)])          #把context送进GRU,为什么输出是隐藏层的通道数的3倍？
@@ -280,7 +365,7 @@ class RAFTStereo(nn.Module):
             inp_list=[list(conv(i).split(dim=1,split_size=conv.out_chasnnels//3)) for i,conv in zip(inp_list,self.context_zqr_convs)]
         corr_block=CorrBlock1D
         corr_fn=corr_block(fmap1,fmap2,radis=self.args.corr_radius,num_levels=self.args.corr_levels)
-        coords0,coords1=self.initialize_flow(net_list[0])
+        coords0,coords1=self.initialize_flow(net_list[0])  #N*2*H1*W1
 
         if flow_init is not None:
             coords1 = coords1 + flow_init
@@ -289,6 +374,13 @@ class RAFTStereo(nn.Module):
         for itr in range(iters):
             coords1=coords1.detach()
             corr=corr_fn(coords1)
+            flow=coords1-coords0
+            with autocast(enabled=self.args.mixed_precision):
+                if self.args.n_gru_layers == 3 and self.args.slow_fast_gru: # Update low-res GRU
+                    net_list = self.update_block(net_list, inp_list, iter32=True, iter16=False, iter08=False, update=False)
+                if self.args.n_gru_layers >= 2 and self.args.slow_fast_gru:# Update low-res GRU and mid-res GRU
+                    net_list = self.update_block(net_list, inp_list, iter32=self.args.n_gru_layers==3, iter16=True, iter08=False, update=False)
+                net_list, up_mask, delta_flow = self.update_block(net_list, inp_list, corr, flow, iter32=self.args.n_gru_layers==3, iter16=self.args.n_gru_layers>=2)
 
 
 
